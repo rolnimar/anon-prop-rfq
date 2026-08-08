@@ -1,0 +1,6 @@
+name,token_input,price_scaled,token_in_decimals,token_out_decimals,expected_raw_value
+asset_decimals_0,1234567890,1000000000,9,0,1
+asset_decimals_2,1234567890,1000000000,9,2,123
+asset_decimals_6,1234567890,1000000000,9,6,1234567
+asset_decimals_8,1234567890,1000000000,9,8,123456789
+asset_decimals_9,1234567890,1000000000,9,9,1234567890
