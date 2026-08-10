@@ -1,0 +1,718 @@
+use crate::constants::seeds;
+use crate::instructions::buffer::accounts::{
+    __client_accounts_buffer_accrual_accounts, __cpi_client_accounts_buffer_accrual_accounts,
+    BufferAccrualAccountsBumps,
+};
+use crate::instructions::buffer::{
+    accrue_buffer::{accrue_buffer_from_accounts, store_buffer_post_supply},
+    BufferAccrualAccounts,
+};
+use crate::instructions::configurable_vault::{
+    get_or_create_configurable_vault_token_account_pair, ConfigurableVaultTokenAccountPairParams,
+};
+use crate::instructions::market_info::{load_main_offer, refresh_market_stats_pda};
+use crate::instructions::offer::offer_utils::{
+    calculate_redemption_vault_refill_amount, is_rwa_token_out_mint,
+    load_redemption_offer_vault_target_bps_for_offer, process_offer_core, should_accrue_rwa_mint,
+    verify_offer_approval,
+};
+use crate::instructions::Offer;
+use crate::state::{ConfigurableVaultKind, State};
+use crate::utils::{
+    execute_token_operations, get_or_create_associated_token_account, program_controls_mint,
+    u64_to_dec9, ApprovalMessage, EnsureAtaParams, ExecTokenOpsParams,
+};
+use anchor_lang::{prelude::*, Accounts};
+use anchor_spl::{
+    associated_token::AssociatedToken,
+    token_interface::{Mint, TokenAccount, TokenInterface},
+};
+use solana_instructions_sysvar::ID as INSTRUCTIONS_SYSVAR_ID;
+
+// Shared offer-execution event definitions.
+
+/// Event emitted when an offer is successfully taken
+///
+/// Provides transparency for tracking offer execution and token exchange details.
+#[event]
+pub struct OfferTakenEvent {
+    /// The PDA address of the offer that was executed
+    pub offer_pda: Pubkey,
+    /// Amount of token_in paid by the user after fee deduction
+    pub token_in_amount: u64,
+    /// Amount of token_out received by the user
+    pub token_out_amount: u64,
+    /// Fee amount deducted from the original token_in payment
+    pub fee_amount: u64,
+    /// Public key of the user who executed the offer
+    pub user: Pubkey,
+}
+
+/// Account structure for executing an offer transaction
+///
+/// This struct defines all accounts required for offer execution including token
+/// operations, approval verification, and flexible burn/mint or transfer mechanisms
+/// depending on program mint authority status.
+#[derive(Accounts)]
+pub struct TakeOffer<'info> {
+    /// The offer account containing pricing vectors and exchange configuration
+    ///
+    /// This account is validated as a PDA derived from token mint addresses
+    /// and contains the pricing vectors used for dynamic price calculation.
+    #[account(
+        mut,
+        seeds = [
+            seeds::OFFER,
+            token_in_mint.key().as_ref(),
+            token_out_mint.key().as_ref()
+        ],
+        bump = offer.load()?.bump
+    )]
+    pub offer: AccountLoader<'info, Offer>,
+
+    /// Program state account containing authorization and kill switch status
+    #[account(
+        seeds = [seeds::STATE],
+        bump = state.bump,
+        has_one = boss @ crate::ProtocolError::InvalidBoss,
+        constraint = !state.is_killed @ crate::ProtocolError::KillSwitchActivated
+    )]
+    pub state: Box<Account<'info, State>>,
+
+    /// The boss account authorized to receive token_in payments
+    ///
+    /// Must match the boss stored in program state for security validation.
+    /// CHECK: Account validation is enforced through state account constraint
+    pub boss: UncheckedAccount<'info>,
+
+    /// Program-derived authority that controls vault token operations
+    ///
+    /// This PDA manages token transfers and burning operations for the
+    /// burn/mint architecture when program has mint authority.
+    /// CHECK: PDA derivation is validated by seeds constraint
+    pub vault_authority: UncheckedAccount<'info>,
+
+    /// Vault account for temporary token_in storage during burn operations
+    ///
+    /// Used for burning input tokens when the program has mint authority
+    /// for efficient burn/mint token exchange architecture.
+    #[account(
+        mut,
+        associated_token::mint = token_in_mint,
+        associated_token::authority = vault_authority,
+        associated_token::token_program = token_in_program
+    )]
+    pub vault_token_in_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Vault account for token_out distribution when using transfer mechanism
+    ///
+    /// Source of output tokens when the program lacks mint authority
+    /// and must transfer from pre-funded vault instead of minting.
+    #[account(
+        mut,
+        associated_token::mint = token_out_mint,
+        associated_token::authority = vault_authority,
+        associated_token::token_program = token_out_program
+    )]
+    pub vault_token_out_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Input token mint account for the exchange
+    ///
+    /// Must be mutable to allow burning operations when program has mint authority.
+    /// Validated against the offer's expected token_in_mint.
+    #[account(
+        mut,
+        constraint =
+            token_in_mint.key() == offer.load()?.token_in_mint
+            @ crate::ProtocolError::InvalidTokenInMint
+    )]
+    pub token_in_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    /// Token program interface for input token operations
+    pub token_in_program: Interface<'info, TokenInterface>,
+
+    /// Output token mint account for the exchange
+    ///
+    /// Must be mutable to allow minting operations when program has mint authority.
+    /// Validated against the offer's expected token_out_mint.
+    #[account(
+        mut,
+        constraint =
+            token_out_mint.key() == offer.load()?.token_out_mint
+            @ crate::ProtocolError::InvalidTokenOutMint
+    )]
+    pub token_out_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    /// Token program interface for output token operations
+    pub token_out_program: Interface<'info, TokenInterface>,
+
+    /// User's input token account for payment
+    ///
+    /// Source account from which the user pays token_in for the exchange.
+    /// Must have sufficient balance for the requested token_in_amount.
+    #[account(
+        mut,
+        associated_token::mint = token_in_mint,
+        associated_token::authority = user,
+        associated_token::token_program = token_in_program
+    )]
+    pub user_token_in_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// User's output token account for receiving exchanged tokens
+    ///
+    /// Destination account where the user receives token_out from the exchange.
+    /// Created automatically if it doesn't exist using init_if_needed.
+    #[account(
+        init_if_needed,
+        payer = user,
+        associated_token::mint = token_out_mint,
+        associated_token::authority = user,
+        associated_token::token_program = token_out_program
+    )]
+    pub user_token_out_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        associated_token::mint = token_in_mint,
+        associated_token::authority = boss,
+        associated_token::token_program = token_in_program
+    )]
+    pub boss_token_in_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Program-derived mint authority for direct token minting
+    ///
+    /// Used when the program has mint authority and can mint token_out
+    /// directly to users instead of transferring from vault.
+    /// CHECK: PDA derivation is validated through seeds constraint
+    pub mint_authority: UncheckedAccount<'info>,
+
+    /// Instructions sysvar for approval signature verification
+    ///
+    /// Required for cryptographic verification of approval messages when offers
+    /// require a signature from state.approver1 or state.approver2.
+    /// CHECK: Validated through address constraint to instructions sysvar
+    pub instructions_sysvar: UncheckedAccount<'info>,
+
+    /// The user executing the offer and paying for account creation
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    /// Associated Token Program for automatic token account creation
+    pub associated_token_program: Program<'info, AssociatedToken>,
+
+    /// System program required for account creation
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct TakeOfferV2<'info> {
+    #[account(
+        mut,
+        seeds = [
+            seeds::OFFER,
+            token_in_mint.key().as_ref(),
+            token_out_mint.key().as_ref()
+        ],
+        bump = offer.load()?.bump
+    )]
+    pub offer: AccountLoader<'info, Offer>,
+
+    #[account(
+        seeds = [seeds::STATE],
+        bump = state.bump,
+        constraint = !state.is_killed @ crate::ProtocolError::KillSwitchActivated
+    )]
+    pub state: Box<Account<'info, State>>,
+
+    /// CHECK: PDA derivation is validated by seeds constraint
+    pub vault_authority: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        associated_token::mint = token_in_mint,
+        associated_token::authority = vault_authority,
+        associated_token::token_program = token_in_program
+    )]
+    pub vault_token_in_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        associated_token::mint = token_out_mint,
+        associated_token::authority = vault_authority,
+        associated_token::token_program = token_out_program
+    )]
+    pub vault_token_out_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint =
+            token_in_mint.key() == offer.load()?.token_in_mint
+            @ crate::ProtocolError::InvalidTokenInMint
+    )]
+    pub token_in_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    pub token_in_program: Interface<'info, TokenInterface>,
+
+    #[account(
+        mut,
+        constraint =
+            token_out_mint.key() == offer.load()?.token_out_mint
+            @ crate::ProtocolError::InvalidTokenOutMint
+    )]
+    pub token_out_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    pub token_out_program: Interface<'info, TokenInterface>,
+
+    #[account(
+        mut,
+        associated_token::mint = token_in_mint,
+        associated_token::authority = user,
+        associated_token::token_program = token_in_program
+    )]
+    pub user_token_in_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// CHECK: Validated and optionally initialized in instruction logic.
+    #[account(mut)]
+    pub user_token_out_account: UncheckedAccount<'info>,
+
+    /// CHECK: Redemption offer PDA for the opposite offer direction; may be uninitialized.
+    pub redemption_offer: UncheckedAccount<'info>,
+
+    /// CHECK: PDA derivation is validated by seeds constraint.
+    #[account(seeds = [seeds::REDEMPTION_OFFER_VAULT_AUTHORITY], bump)]
+    pub redemption_vault_authority: UncheckedAccount<'info>,
+
+    /// CHECK: Validated and optionally initialized in instruction logic.
+    #[account(mut)]
+    pub redemption_vault_token_in_account: UncheckedAccount<'info>,
+
+    /// CHECK: PDA and data are validated/initialized in instruction logic.
+    #[account(mut)]
+    pub offer_proceeds_vault: UncheckedAccount<'info>,
+
+    /// CHECK: Validated and optionally initialized in instruction logic.
+    #[account(mut)]
+    pub offer_proceeds_token_in_account: UncheckedAccount<'info>,
+
+    /// CHECK: PDA and data are validated/initialized in instruction logic.
+    #[account(mut)]
+    pub offer_fee_vault: UncheckedAccount<'info>,
+
+    /// CHECK: Validated and optionally initialized in instruction logic.
+    #[account(mut)]
+    pub offer_fee_token_in_account: UncheckedAccount<'info>,
+
+    /// CHECK: PDA derivation is validated through seeds constraint
+    pub mint_authority: UncheckedAccount<'info>,
+
+    pub buffer_accounts: BufferAccrualAccounts<'info>,
+
+    /// CHECK: The handler validates PDA, writability, owner, and account data layout.
+    #[account(mut)]
+    pub market_stats: UncheckedAccount<'info>,
+
+    /// CHECK: PDA validation and data loading are handled by market stats refresh.
+    pub circulating_supply_excluded_balance: UncheckedAccount<'info>,
+
+    /// CHECK: Validated through address constraint to instructions sysvar
+    pub instructions_sysvar: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: Validated in instruction logic against state.main_offer.
+    pub main_offer: UncheckedAccount<'info>,
+}
+
+/// Executes an offer transaction with flexible burn/mint or transfer mechanisms
+///
+/// This instruction allows users to accept offers by paying the current market price
+/// calculated using discrete interval pricing with APR-based growth. The implementation
+/// uses smart token distribution logic based on program mint authority status.
+///
+/// The instruction handles approval verification, price calculation, fee deduction,
+/// and token operations with automatic fallback between mint/burn and transfer modes.
+///
+/// # Arguments
+/// * `ctx` - The instruction context containing validated accounts
+/// * `token_in_amount` - Amount of token_in the user is willing to pay (including fees)
+/// * `approval_message` - Optional cryptographic approval from trusted authority
+///
+/// # Process Flow
+/// 1. Verify approval requirements if offer needs approval
+/// 2. Find active pricing vector and calculate current price
+/// 3. Calculate token_out amount and fees based on current price
+/// 4. Execute token operations (burn/mint or transfer based on mint authority)
+/// 5. Emit event with transaction details
+///
+/// # Returns
+/// * `Ok(())` - If the offer is successfully executed
+/// * `Err(_)` - If validation fails, no active vector, or token operations fail
+///
+/// # Access Control
+/// - Any user can execute offers unless approval is required
+/// - Kill switch prevents execution when activated
+/// - Approval verification against trusted authority when needed
+///
+/// # Events
+/// * `OfferTakenEvent` - Emitted with execution details and token amounts
+pub fn take_offer<'info>(
+    ctx: Context<'info, TakeOffer<'info>>,
+    token_in_amount: u64,
+    approval_message: Option<ApprovalMessage>,
+) -> Result<()> {
+    let (vault_authority_bump, mint_authority_bump) = validate_take_offer_authorities(
+        ctx.program_id,
+        &ctx.accounts.vault_authority,
+        &ctx.accounts.mint_authority,
+        &ctx.accounts.instructions_sysvar,
+    )?;
+    let offer = ctx.accounts.offer.load()?;
+    offer.require_enabled()?;
+
+    verify_offer_approval(
+        &offer,
+        &approval_message,
+        ctx.program_id,
+        &ctx.accounts.user.key(),
+        &ctx.accounts.state.approver1,
+        &ctx.accounts.state.approver2,
+        &ctx.accounts.instructions_sysvar,
+    )?;
+
+    let result = process_offer_core(
+        &offer,
+        token_in_amount,
+        &ctx.accounts.token_in_mint,
+        &ctx.accounts.token_out_mint,
+        offer.fee_basis_points,
+    )?;
+    execute_token_operations(ExecTokenOpsParams {
+        token_in_program: &ctx.accounts.token_in_program,
+        token_in_mint: &ctx.accounts.token_in_mint,
+        token_in_net_amount: result.token_in_net_amount,
+        token_in_fee_amount: result.token_in_fee_amount,
+        token_in_authority: &ctx.accounts.user,
+        token_in_source_signer_seeds: None,
+        vault_authority_signer_seeds: Some(&[&[
+            seeds::OFFER_VAULT_AUTHORITY,
+            &[vault_authority_bump],
+        ]]),
+        token_in_source_account: &ctx.accounts.user_token_in_account,
+        token_in_destination_account: &ctx.accounts.boss_token_in_account,
+        token_in_refill_destination_account: None,
+        token_in_refill_amount: 0,
+        token_in_fee_destination_account: &ctx.accounts.boss_token_in_account,
+        token_in_burn_account: &ctx.accounts.vault_token_in_account,
+        token_in_burn_authority: &ctx.accounts.vault_authority.to_account_info(),
+        token_out_program: &ctx.accounts.token_out_program,
+        token_out_mint: &ctx.accounts.token_out_mint,
+        token_out_amount: result.token_out_amount,
+        token_out_authority: &ctx.accounts.vault_authority.to_account_info(),
+        token_out_source_account: &ctx.accounts.vault_token_out_account,
+        token_out_destination_account: &ctx.accounts.user_token_out_account,
+        mint_authority_pda: &ctx.accounts.mint_authority.to_account_info(),
+        mint_authority_bump: &[mint_authority_bump],
+        token_out_max_supply: ctx.accounts.state.max_supply,
+        token_out_max_mint_amount: ctx.accounts.state.max_mint_amount,
+    })?;
+
+    msg!(
+        "Offer taken - PDA: {}, token_in(+fee): {}(+{}), token_out: {}, user: {}, price: {}",
+        ctx.accounts.offer.key(),
+        result.token_in_net_amount,
+        result.token_in_fee_amount,
+        result.token_out_amount,
+        ctx.accounts.user.key,
+        u64_to_dec9(result.current_price)
+    );
+
+    emit!(OfferTakenEvent {
+        offer_pda: ctx.accounts.offer.key(),
+        token_in_amount: result.token_in_net_amount,
+        token_out_amount: result.token_out_amount,
+        fee_amount: result.token_in_fee_amount,
+        user: ctx.accounts.user.key(),
+    });
+
+    Ok(())
+}
+
+pub fn take_offer_v2<'info>(
+    ctx: Context<'info, TakeOfferV2<'info>>,
+    token_in_amount: u64,
+    approval_message: Option<ApprovalMessage>,
+) -> Result<()> {
+    execute_take_offer_v2(ctx, token_in_amount, approval_message)
+}
+pub fn execute_take_offer_v2<'info>(
+    ctx: Context<'info, TakeOfferV2<'info>>,
+    token_in_amount: u64,
+    approval_message: Option<ApprovalMessage>,
+) -> Result<()> {
+    let (vault_authority_bump, mint_authority_bump) = validate_take_offer_authorities(
+        ctx.program_id,
+        &ctx.accounts.vault_authority,
+        &ctx.accounts.mint_authority,
+        &ctx.accounts.instructions_sysvar,
+    )?;
+    let offer = ctx.accounts.offer.load()?;
+    offer.require_enabled()?;
+    let buffer_is_initialized = ctx
+        .accounts
+        .buffer_accounts
+        .check_is_initialized(ctx.program_id)?;
+    let should_accrue_rwa_mint = should_accrue_rwa_mint(
+        &ctx.accounts.state,
+        &ctx.accounts.token_out_mint,
+        buffer_is_initialized,
+        &ctx.accounts.mint_authority.to_account_info(),
+    );
+    let main_offer = if is_rwa_token_out_mint(&ctx.accounts.state, &ctx.accounts.token_out_mint) {
+        Some(load_main_offer(
+            ctx.program_id,
+            &ctx.accounts.main_offer.to_account_info(),
+            &ctx.accounts.state,
+        )?)
+    } else {
+        None
+    };
+
+    verify_offer_approval(
+        &offer,
+        &approval_message,
+        ctx.program_id,
+        &ctx.accounts.user.key(),
+        &ctx.accounts.state.approver1,
+        &ctx.accounts.state.approver2,
+        &ctx.accounts.instructions_sysvar,
+    )?;
+
+    let result = process_offer_core(
+        &offer,
+        token_in_amount,
+        &ctx.accounts.token_in_mint,
+        &ctx.accounts.token_out_mint,
+        offer.fee_basis_points,
+    )?;
+    let redemption_vault_target_bps = load_redemption_offer_vault_target_bps_for_offer(
+        ctx.program_id,
+        &ctx.accounts.redemption_offer,
+        ctx.accounts.offer.key(),
+        ctx.accounts.token_in_mint.key(),
+        ctx.accounts.token_out_mint.key(),
+    )?
+    .unwrap_or(0);
+    let (offer_proceeds_token_in_account, offer_fee_token_in_account) =
+        get_or_create_configurable_vault_token_account_pair::<
+            { ConfigurableVaultKind::OfferProceeds.as_u8() },
+            { ConfigurableVaultKind::OfferFee.as_u8() },
+        >(ConfigurableVaultTokenAccountPairParams {
+            first_vault: &ctx.accounts.offer_proceeds_vault,
+            first_token_account: &ctx.accounts.offer_proceeds_token_in_account,
+            second_vault: &ctx.accounts.offer_fee_vault,
+            second_token_account: &ctx.accounts.offer_fee_token_in_account,
+            payer: ctx.accounts.user.to_account_info(),
+            mint_account: ctx.accounts.token_in_mint.to_account_info(),
+            token_program: ctx.accounts.token_in_program.to_account_info(),
+            associated_token_program: ctx.accounts.associated_token_program.to_account_info(),
+            system_program: ctx.accounts.system_program.to_account_info(),
+            program_id: ctx.program_id,
+        })?;
+    let should_refill_redemption_vault = redemption_vault_target_bps > 0
+        && !program_controls_mint(
+            &ctx.accounts.token_in_mint,
+            &ctx.accounts.mint_authority.to_account_info(),
+        );
+    let redemption_vault_token_in_account = if should_refill_redemption_vault {
+        Some(get_or_create_associated_token_account(EnsureAtaParams {
+            ata_account: &ctx.accounts.redemption_vault_token_in_account,
+            payer: ctx.accounts.user.to_account_info(),
+            authority_account: ctx.accounts.redemption_vault_authority.to_account_info(),
+            mint_account: ctx.accounts.token_in_mint.to_account_info(),
+            token_program: ctx.accounts.token_in_program.to_account_info(),
+            associated_token_program: ctx.accounts.associated_token_program.to_account_info(),
+            system_program: ctx.accounts.system_program.to_account_info(),
+            authority: ctx.accounts.redemption_vault_authority.key(),
+            mint: ctx.accounts.token_in_mint.key(),
+            token_program_id: ctx.accounts.token_in_program.key(),
+            invalid_account_error: crate::ProtocolError::InvalidVaultTokenInAccount,
+        })?)
+    } else {
+        None
+    };
+    let redemption_vault_refill_amount = redemption_vault_token_in_account
+        .as_ref()
+        .map(|account| {
+            calculate_redemption_vault_refill_amount(
+                &ctx.accounts.market_stats.to_account_info(),
+                redemption_vault_target_bps,
+                &ctx.accounts.token_in_mint,
+                &ctx.accounts.token_out_mint,
+                account.amount,
+                result.token_in_net_amount,
+            )
+        })
+        .unwrap_or(0);
+
+    get_or_create_associated_token_account(EnsureAtaParams {
+        ata_account: &ctx.accounts.user_token_out_account,
+        payer: ctx.accounts.user.to_account_info(),
+        authority_account: ctx.accounts.user.to_account_info(),
+        mint_account: ctx.accounts.token_out_mint.to_account_info(),
+        token_program: ctx.accounts.token_out_program.to_account_info(),
+        associated_token_program: ctx.accounts.associated_token_program.to_account_info(),
+        system_program: ctx.accounts.system_program.to_account_info(),
+        authority: ctx.accounts.user.key(),
+        mint: ctx.accounts.token_out_mint.key(),
+        token_program_id: ctx.accounts.token_out_program.key(),
+        invalid_account_error: crate::ProtocolError::InvalidUserTokenOutAccount,
+    })?;
+    let user_token_out_account = InterfaceAccount::try_from(&ctx.accounts.user_token_out_account)?;
+    let accrual = if should_accrue_rwa_mint {
+        let canonical_offer = main_offer
+            .as_ref()
+            .ok_or(crate::ProtocolError::InvalidMainOffer)?;
+        Some(accrue_buffer_from_accounts(
+            ctx.program_id,
+            &ctx.accounts.state,
+            &ctx.accounts.buffer_accounts,
+            canonical_offer,
+            &ctx.accounts.token_out_mint,
+            ctx.accounts.mint_authority.to_account_info(),
+            mint_authority_bump,
+            &ctx.accounts.token_out_program,
+        )?)
+    } else {
+        None
+    };
+
+    if accrual.is_some() {
+        ctx.accounts.token_out_mint.reload()?;
+    }
+
+    execute_token_operations(ExecTokenOpsParams {
+        token_in_program: &ctx.accounts.token_in_program,
+        token_in_mint: &ctx.accounts.token_in_mint,
+        token_in_net_amount: result.token_in_net_amount,
+        token_in_fee_amount: result.token_in_fee_amount,
+        token_in_authority: &ctx.accounts.user,
+        token_in_source_signer_seeds: None,
+        vault_authority_signer_seeds: Some(&[&[
+            seeds::OFFER_VAULT_AUTHORITY,
+            &[vault_authority_bump],
+        ]]),
+        token_in_source_account: &ctx.accounts.user_token_in_account,
+        token_in_destination_account: &offer_proceeds_token_in_account,
+        token_in_refill_destination_account: redemption_vault_token_in_account.as_ref(),
+        token_in_refill_amount: redemption_vault_refill_amount,
+        token_in_fee_destination_account: &offer_fee_token_in_account,
+        token_in_burn_account: &ctx.accounts.vault_token_in_account,
+        token_in_burn_authority: &ctx.accounts.vault_authority.to_account_info(),
+        token_out_program: &ctx.accounts.token_out_program,
+        token_out_mint: &ctx.accounts.token_out_mint,
+        token_out_amount: result.token_out_amount,
+        token_out_authority: &ctx.accounts.vault_authority.to_account_info(),
+        token_out_source_account: &ctx.accounts.vault_token_out_account,
+        token_out_destination_account: &user_token_out_account,
+        mint_authority_pda: &ctx.accounts.mint_authority.to_account_info(),
+        mint_authority_bump: &[mint_authority_bump],
+        token_out_max_supply: ctx.accounts.state.max_supply,
+        token_out_max_mint_amount: ctx.accounts.state.max_mint_amount,
+    })?;
+
+    if let Some(accrual) = accrual {
+        let post_offer_supply = accrual
+            .post_accrual_supply
+            .checked_add(result.token_out_amount)
+            .ok_or(crate::ProtocolError::MathOverflow)?;
+        store_buffer_post_supply(
+            &ctx.accounts.buffer_accounts,
+            post_offer_supply,
+            accrual.timestamp,
+        )?;
+    }
+
+    if is_rwa_token_out_mint(&ctx.accounts.state, &ctx.accounts.token_out_mint) {
+        let main_offer = main_offer
+            .as_ref()
+            .ok_or(crate::ProtocolError::InvalidMainOffer)?;
+        ctx.accounts.token_out_mint.reload()?;
+        let (market_stats_pda, _) =
+            Pubkey::find_program_address(&[seeds::MARKET_STATS], ctx.program_id);
+        require_keys_eq!(
+            market_stats_pda,
+            ctx.accounts.market_stats.key(),
+            crate::ProtocolError::InvalidMarketStatsPda
+        );
+        require!(
+            ctx.accounts.market_stats.is_writable,
+            crate::ProtocolError::MarketStatsNotWritable
+        );
+        refresh_market_stats_pda(
+            main_offer,
+            &ctx.accounts.token_out_mint,
+            &ctx.accounts
+                .circulating_supply_excluded_balance
+                .to_account_info(),
+            &ctx.accounts.market_stats.to_account_info(),
+            &ctx.accounts.user.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            ctx.program_id,
+        )?;
+    }
+
+    msg!(
+        "Offer taken - PDA: {}, token_in(+fee): {}(+{}), token_out: {}, user: {}, price: {}",
+        ctx.accounts.offer.key(),
+        result.token_in_net_amount,
+        result.token_in_fee_amount,
+        result.token_out_amount,
+        ctx.accounts.user.key,
+        u64_to_dec9(result.current_price)
+    );
+
+    emit!(OfferTakenEvent {
+        offer_pda: ctx.accounts.offer.key(),
+        token_in_amount: result.token_in_net_amount,
+        token_out_amount: result.token_out_amount,
+        fee_amount: result.token_in_fee_amount,
+        user: ctx.accounts.user.key(),
+    });
+
+    Ok(())
+}
+
+pub fn validate_take_offer_authorities(
+    program_id: &Pubkey,
+    vault_authority: &UncheckedAccount,
+    mint_authority: &UncheckedAccount,
+    instructions_sysvar: &UncheckedAccount,
+) -> Result<(u8, u8)> {
+    let (expected_vault_authority, vault_authority_bump) =
+        Pubkey::find_program_address(&[seeds::OFFER_VAULT_AUTHORITY], program_id);
+    require_keys_eq!(
+        expected_vault_authority,
+        vault_authority.key(),
+        crate::ProtocolError::InvalidVaultAuthority
+    );
+
+    let (expected_mint_authority, mint_authority_bump) =
+        Pubkey::find_program_address(&[seeds::MINT_AUTHORITY], program_id);
+    require_keys_eq!(
+        expected_mint_authority,
+        mint_authority.key(),
+        crate::ProtocolError::InvalidMintAuthority
+    );
+
+    require_keys_eq!(
+        INSTRUCTIONS_SYSVAR_ID,
+        instructions_sysvar.key(),
+        crate::ProtocolError::InvalidInstructionsSysvar
+    );
+
+    Ok((vault_authority_bump, mint_authority_bump))
+}

@@ -1,0 +1,13 @@
+mechanism,worst_protected_order_discount_bps,max_split_gain_nav_bps,max_split_gain_relative_bps,minimum_reserve_remaining_bps,failed_split_parts
+fixed_nav,0,0,0,1000,0
+static_100_bps,100,0,0,1090,0
+static_300_bps,300,0,0,1270,0
+static_500_bps,500,0,0,1450,0
+static_700_bps,700,0,0,1630,0
+static_1000_bps,1000,0,0,1900,0
+static_2000_bps,2000,0,0,2800,0
+static_3000_bps,3000,0,0,3700,0
+integrated_curve,539,0,0,1138,0
+prop_endpoint,1,537,568,1000,0
+prop_pressure,1,7001,23787,1049,0
+prop_full,7,6205,21081,1766,0

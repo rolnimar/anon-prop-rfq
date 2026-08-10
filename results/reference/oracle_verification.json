@@ -1,0 +1,8 @@
+{
+  "decimal_vectors": 5,
+  "maximum_absolute_difference_base_units": 20,
+  "pricing_fixture_rows": 34,
+  "pricing_vectors": 34,
+  "test_groups_passed": 2,
+  "worst_vector": "reference_raw_9b"
+}

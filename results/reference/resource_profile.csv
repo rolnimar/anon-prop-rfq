@@ -1,0 +1,5 @@
+instruction,samples,compute_units_min,compute_units_median,compute_units_max,instruction_accounts,unique_legacy_accounts,legacy_wire_bytes,legacy_fits_1232_bytes,v0_lookup_wire_bytes,v0_lookup_fits_1232_bytes
+open_swap_buy,100,147359,169828,205828,34,35,1355,False,430,True
+open_swap_sell,100,193329,211320,247320,31,32,1256,False,424,True
+quote_sell,100,38065,44078,60578,10,13,555,True,281,True
+quote_swap_buy,100,15264,16777,27277,5,8,390,True,271,True

@@ -1,0 +1,138 @@
+use crate::constants::seeds;
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::system_program;
+
+/// Event emitted when the state account is successfully closed
+///
+/// Provides transparency for tracking the closure of the program's main state account.
+#[event]
+pub struct StateClosedEvent {
+    /// The PDA address of the state account that was closed
+    pub state_pda: Pubkey,
+    /// The boss account that initiated the closure and received the rent
+    pub boss: Pubkey,
+}
+
+/// Account structure for closing the program state account
+///
+/// This struct defines the accounts required to close the current program state
+/// account and transfer its rent balance back to the boss.
+/// Only the boss can close the state account.
+///
+/// Note: The state account is NOT deserialized to allow closing accounts with
+/// incompatible or outdated State structures.
+#[derive(Accounts)]
+pub struct CloseState<'info> {
+    /// The state account to be closed and its rent reclaimed
+    ///
+    /// This account is validated as a PDA derived from the "state" seed.
+    /// The account will be closed and its rent transferred to the boss.
+    ///
+    /// CHECK: Manual validation of PDA and boss without deserialization
+    #[account(mut)]
+    pub state: UncheckedAccount<'info>,
+
+    /// The boss account authorized to close the state and receive rent
+    ///
+    /// Must match the boss stored in the state account.
+    /// This signer will receive the rent from the closed state account.
+    #[account(mut)]
+    pub boss: Signer<'info>,
+
+    /// System program required for account closure and rent transfer
+    pub system_program: Program<'info, System>,
+}
+
+/// Closes the current program state account and reclaims its rent balance
+///
+/// This instruction removes the current program state account and transfers its rent
+/// balance back to the boss. The closed account data cannot be recovered. All program
+/// configuration and governance settings stored in that account are lost.
+///
+/// Most instructions require an initialized state account. The state PDA can be
+/// initialized again later, but it starts from fresh configuration. Use with extreme caution.
+///
+/// The state account is NOT deserialized, allowing this instruction to work even
+/// when the on-chain State structure doesn't match the current program's State definition.
+///
+/// # Arguments
+/// * `ctx` - The instruction context containing validated accounts
+///
+/// # Returns
+/// * `Ok(())` - If the state is successfully closed and rent reclaimed
+///
+/// # Access Control
+/// - Only the boss can call this instruction
+/// - Boss account must match the one stored in program state
+///
+/// # Effects
+/// - Current state account data is deleted
+/// - Rent balance is transferred to the boss
+/// - Instructions requiring state stop working until state is initialized again
+///
+/// # Events
+/// * `StateClosedEvent` - Emitted with state PDA and boss details
+pub fn close_state(ctx: Context<CloseState>) -> Result<()> {
+    let state = &ctx.accounts.state;
+
+    // 0) Sanity: we must own the account to mutate lamports/metadata directly
+    require_keys_eq!(
+        *state.owner,
+        crate::ID,
+        crate::ProtocolError::InvalidStateOwner
+    );
+
+    // 1) Validate PDA address from seeds
+    let (expected_state_pda, _bump) = Pubkey::find_program_address(&[seeds::STATE], &crate::ID);
+    require_keys_eq!(
+        state.key(),
+        expected_state_pda,
+        crate::ProtocolError::InvalidStatePda
+    );
+
+    // 2) Read the stored boss pubkey from raw bytes (no deserialize),
+    //    ensure we DROP the data borrow before mutating the account later.
+    //    Layout: [8-byte discriminator][32-byte boss][...]
+    let stored_boss = {
+        let data = state.try_borrow_data()?;
+        require!(data.len() >= 40, crate::ProtocolError::InvalidStateData);
+
+        // bytes 8..40 -> boss pubkey
+        let arr: [u8; 32] = data[8..40]
+            .try_into()
+            .map_err(|_| error!(crate::ProtocolError::InvalidStateData))?;
+        Pubkey::new_from_array(arr)
+    };
+
+    let boss = &ctx.accounts.boss.to_account_info();
+
+    // 3) Verify signer matches stored boss
+    require_keys_eq!(
+        boss.key(),
+        stored_boss,
+        crate::ProtocolError::UnauthorizedSigner
+    );
+
+    // 4) Drain lamports safely (checked math), then zero the source.
+    let state_lamports = state.lamports();
+
+    // add first (checked), then zero state
+    let boss_lamports_before = boss.lamports();
+    let boss_lamport_after = boss_lamports_before
+        .checked_add(state_lamports)
+        .ok_or_else(|| error!(crate::ProtocolError::LamportOverflow))?;
+    **boss.try_borrow_mut_lamports()? = boss_lamport_after;
+    **state.try_borrow_mut_lamports()? = 0;
+
+    // 5) Deallocate & hand ownership back to System Program
+    // (Make sure we no longer hold any data borrows at this point.)
+    state.resize(0)?;
+    state.assign(&system_program::ID);
+
+    emit!(StateClosedEvent {
+        state_pda: state.key(),
+        boss: boss.key(),
+    });
+
+    Ok(())
+}

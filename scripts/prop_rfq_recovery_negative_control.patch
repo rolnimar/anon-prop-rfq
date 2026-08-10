@@ -1,0 +1,24 @@
+diff --git a/programs/rwa_exit/src/instructions/prop_rfq/pricing.rs b/programs/rwa_exit/src/instructions/prop_rfq/pricing.rs
+--- a/programs/rwa_exit/src/instructions/prop_rfq/pricing.rs
++++ b/programs/rwa_exit/src/instructions/prop_rfq/pricing.rs
+@@ -236,10 +236,7 @@ pub fn roll_prop_rfq_volume_tracker(
+         prop_rfq_pair_state.curr_sell_value_stable = 0;
+         prop_rfq_pair_state.curr_buy_value_stable = 0;
+         prop_rfq_pair_state.curr_sell_trade_count = 0;
+-        prop_rfq_pair_state.epoch_start = prop_rfq_pair_state
+-            .epoch_start
+-            .checked_add(epoch_duration)
+-            .ok_or(crate::ProtocolError::MathOverflow)?;
++        prop_rfq_pair_state.epoch_start = now;
+     }
+ 
+     Ok(())
+@@ -293,7 +290,7 @@ pub fn preview_effective_sell_volume(
+             if elapsed >= epoch_duration.saturating_mul(2) {
+                 (0, 0, 0)
+             } else if elapsed >= epoch_duration {
+-                (current_net, 0, elapsed.saturating_sub(epoch_duration))
++                (current_net, 0, 0)
+             } else {
+                 (
+                     prop_rfq_pair_state.prev_net_sell_value_stable,

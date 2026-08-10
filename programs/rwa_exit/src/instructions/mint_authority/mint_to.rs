@@ -1,0 +1,217 @@
+use crate::constants::seeds;
+use crate::instructions::buffer::{
+    __client_accounts_buffer_accrual_accounts, __cpi_client_accounts_buffer_accrual_accounts,
+    accounts::BufferAccrualAccountsBumps,
+    accrue_buffer::{accrue_buffer_from_accounts, store_buffer_post_supply},
+    BufferAccrualAccounts,
+};
+use crate::instructions::market_info::{load_main_offer, refresh_market_stats_pda};
+use crate::instructions::offer::offer_utils::should_accrue_rwa_mint;
+use crate::state::State;
+use crate::utils::token_utils::mint_tokens;
+use anchor_lang::prelude::*;
+use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
+
+/// Event emitted when Rwa tokens are successfully minted to the boss account
+///
+/// Provides transparency for tracking token minting operations performed by the boss.
+#[event]
+pub struct RwaTokensMintedEvent {
+    /// The Rwa mint from which tokens were minted
+    pub rwa_mint: Pubkey,
+    /// The boss account that received the newly minted tokens
+    pub boss: Pubkey,
+    /// The amount of tokens minted in base units
+    pub amount: u64,
+}
+
+/// Account structure for minting Rwa tokens to the boss
+///
+/// This struct defines the accounts required for the boss to mint new Rwa tokens
+/// to their own account. Requires program mint authority and boss authorization.
+#[derive(Accounts)]
+pub struct MintTo<'info> {
+    /// The program state account containing boss and Rwa mint validation
+    #[account(
+        seeds = [seeds::STATE],
+        bump = state.bump,
+        has_one = boss,
+        has_one = rwa_mint,
+        constraint = !state.is_killed @ crate::ProtocolError::KillSwitchActivated,
+        constraint = state.main_offer != Pubkey::default() @ crate::ProtocolError::InvalidMainOffer
+    )]
+    pub state: Box<Account<'info, State>>,
+
+    /// The boss authorized to perform minting operations
+    ///
+    /// Must be the boss stored in the program state and pay for any
+    /// account creation if the token account doesn't exist.
+    #[account(mut)]
+    pub boss: Signer<'info>,
+
+    /// The Rwa token mint account for minting new tokens
+    ///
+    /// Must match the Rwa mint stored in program state and be mutable
+    /// to allow supply updates during minting.
+    #[account(mut)]
+    pub rwa_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    /// The boss's Rwa token account to receive minted tokens
+    ///
+    /// If the account doesn't exist, it will be created automatically
+    /// as an Associated Token Account with the boss as the authority.
+    #[account(
+        init_if_needed,
+        payer = boss,
+        associated_token::mint = rwa_mint,
+        associated_token::authority = boss,
+        associated_token::token_program = token_program
+    )]
+    pub boss_rwa_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// Program-derived account that serves as the mint authority
+    ///
+    /// This PDA must be the current mint authority for the Rwa token.
+    /// Validated to ensure the program has permission to mint tokens.
+    /// CHECK: PDA derivation is validated by seeds constraint
+    /// CHECK: PDA derivation is validated by seeds constraint and mint authority constraint.
+    #[account(
+        seeds = [seeds::MINT_AUTHORITY],
+        constraint = rwa_mint.mint_authority.unwrap() == mint_authority.key() @ crate::ProtocolError::NoMintAuthority,
+        bump
+    )]
+    pub mint_authority: UncheckedAccount<'info>,
+
+    /// SPL Token program for minting operations
+    pub token_program: Interface<'info, TokenInterface>,
+
+    /// Associated Token Program for automatic token account creation
+    pub associated_token_program: Program<'info, AssociatedToken>,
+
+    /// System program required for account creation and rent payment
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: Parsed and validated against `state.main_offer` in instruction logic.
+    pub main_offer: UncheckedAccount<'info>,
+
+    pub buffer_accounts: BufferAccrualAccounts<'info>,
+
+    /// CHECK: Validated and optionally initialized in instruction logic.
+    #[account(mut)]
+    pub market_stats: UncheckedAccount<'info>,
+
+    /// CHECK: PDA validation and data loading are handled by market stats refresh.
+    pub circulating_supply_excluded_balance: UncheckedAccount<'info>,
+}
+
+/// Mints new Rwa tokens directly to the boss's account
+///
+/// This instruction allows the boss to create new Rwa tokens and add them to their
+/// own token account. The operation requires the program to have mint authority for
+/// the Rwa token, which must be transferred via `transfer_mint_authority_to_program`.
+///
+/// The boss's token account is created automatically if it doesn't exist. The minting
+/// operation increases the total supply of Rwa tokens and emits an event for tracking.
+/// `state.main_offer` must be configured, and the matching offer account must be supplied.
+///
+/// # Arguments
+/// * `ctx` - The instruction context containing validated accounts
+/// * `amount` - The amount of Rwa tokens to mint in base units
+///
+/// # Returns
+/// * `Ok(())` - If minting completes successfully
+/// * `Err(crate::ProtocolError::NoMintAuthority)` - If program lacks mint authority
+/// * `Err(_)` - If token minting operation fails
+///
+/// # Access Control
+/// - Only the boss can call this instruction
+/// - Program must have mint authority for the Rwa token
+/// - Boss account must match the one stored in program state
+///
+/// # Events
+/// * `RwaTokensMintedEvent` - Emitted on successful minting with details
+pub fn mint_to(ctx: Context<MintTo>, amount: u64) -> Result<()> {
+    let offer = load_main_offer(
+        ctx.program_id,
+        &ctx.accounts.main_offer.to_account_info(),
+        &ctx.accounts.state,
+    )?;
+    let buffer_is_initialized = ctx
+        .accounts
+        .buffer_accounts
+        .check_is_initialized(ctx.program_id)?;
+    let should_accrue = should_accrue_rwa_mint(
+        &ctx.accounts.state,
+        &ctx.accounts.rwa_mint,
+        buffer_is_initialized,
+        &ctx.accounts.mint_authority.to_account_info(),
+    );
+    let accrual = if should_accrue {
+        Some(accrue_buffer_from_accounts(
+            ctx.program_id,
+            &ctx.accounts.state,
+            &ctx.accounts.buffer_accounts,
+            &offer,
+            &ctx.accounts.rwa_mint,
+            ctx.accounts.mint_authority.to_account_info(),
+            ctx.bumps.mint_authority,
+            &ctx.accounts.token_program,
+        )?)
+    } else {
+        None
+    };
+
+    if accrual.is_some() {
+        ctx.accounts.rwa_mint.reload()?;
+    }
+
+    let mint_authority_seeds = &[seeds::MINT_AUTHORITY, &[ctx.bumps.mint_authority]];
+    let mint_authority_signer_seeds = &[mint_authority_seeds.as_slice()];
+    mint_tokens(
+        &ctx.accounts.token_program,
+        &ctx.accounts.rwa_mint,
+        &ctx.accounts.boss_rwa_account.to_account_info(),
+        &ctx.accounts.mint_authority.to_account_info(),
+        mint_authority_signer_seeds,
+        amount,
+        ctx.accounts.state.max_supply,
+        ctx.accounts.state.max_mint_amount,
+    )?;
+
+    if let Some(accrual) = accrual {
+        let post_mint_supply = accrual
+            .post_accrual_supply
+            .checked_add(amount)
+            .ok_or(crate::ProtocolError::MathOverflow)?;
+        store_buffer_post_supply(
+            &ctx.accounts.buffer_accounts,
+            post_mint_supply,
+            accrual.timestamp,
+        )?;
+    }
+
+    ctx.accounts.rwa_mint.reload()?;
+    refresh_market_stats_pda(
+        &offer,
+        &ctx.accounts.rwa_mint,
+        &ctx.accounts
+            .circulating_supply_excluded_balance
+            .to_account_info(),
+        &ctx.accounts.market_stats.to_account_info(),
+        &ctx.accounts.boss.to_account_info(),
+        &ctx.accounts.system_program.to_account_info(),
+        ctx.program_id,
+    )?;
+
+    msg!("Minted {} Rwa tokens to boss account", amount);
+
+    // Emit event for transparency and off-chain tracking
+    emit!(RwaTokensMintedEvent {
+        rwa_mint: ctx.accounts.rwa_mint.key(),
+        boss: ctx.accounts.boss.key(),
+        amount,
+    });
+
+    Ok(())
+}

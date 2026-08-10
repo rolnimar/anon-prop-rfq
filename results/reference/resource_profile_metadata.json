@@ -1,0 +1,26 @@
+{
+  "elapsed_seconds": 32.075,
+  "git": {
+    "commit": "dc4999ea675b46e0ced77ab34ab100725df5d877",
+    "dirty": false
+  },
+  "packet_data_limit_bytes": 1232,
+  "platform": {
+    "cpu_count": 12,
+    "machine": "arm64",
+    "processor": "arm",
+    "system": "Darwin"
+  },
+  "resource_profile_seed": "PROP_RFQ_RESOURCE_SAMPLE=0..samples-1",
+  "samples": 100,
+  "toolchain": {
+    "anchor": "anchor-cli 1.1.2",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "cargo_build_sbf": "cargo-build-sbf 4.0.0\nplatform-tools v1.53\nrustc 1.89.0",
+    "litesvm": "0.14.0",
+    "python": "3.14.3",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "solana": "solana-cli 4.0.2 (src:549805f3; feat:6ff76655, client:Agave)",
+    "uv": "uv 0.11.6 (65950801c 2026-04-09 aarch64-apple-darwin)"
+  }
+}

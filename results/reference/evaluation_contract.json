@@ -1,0 +1,48 @@
+{
+  "protocol_revision": 9,
+  "parameter_grid": {
+    "haircut_bps": [100, 300, 500, 700, 1000, 1500, 2000, 3000, 5000, 10000],
+    "exponent_scaled_1e4": [10000, 15000, 20000, 25000, 30000, 40000, 50000, 70000, 100000],
+    "wall_sensitivity_scaled_1e4": [2500, 5000, 10000, 20000, 40000, 80000, 160000],
+    "cadence_threshold": [5, 10, 20, 40],
+    "cadence_wave_scaled_1e4": [0, 5000, 10000, 20000, 30000, 50000],
+    "cartesian_product_count": 15120
+  },
+  "workloads": {
+    "small_after_stress": {
+      "stress_exit_bps": [1000, 2500, 5000, 9000],
+      "following_exit_bps": [1, 10, 100]
+    },
+    "splitting": {
+      "total_exit_bps": [1000, 2500, 5000, 9000],
+      "parts": [1, 2, 5, 10, 20, 100],
+      "timing": ["within_epoch", "across_boundary"],
+      "aggregate_mitigation_parts": [2, 5, 10, 20, 100],
+      "aggregate_mitigation_workloads": 40,
+      "aggregate_mitigation_weighting": "equal sum over each declared workload"
+    },
+    "cadence": {
+      "preliminary_trade_count": [1, 5, 10, 20, 100],
+      "dust_trade_base_units": 1000,
+      "honest_burst_trade_bps": 10
+    },
+    "buy_relief_bps_of_prior_sell": [0, 2500, 5000, 10000],
+    "ordering": ["stress_then_small", "small_then_stress"],
+    "recovery_offset_quarters": [0, 1, 2, 4, 5, 6, 8]
+  },
+  "integrated_curve_baseline": {
+    "marginal_payout": "1 - 0.07*x^2.5",
+    "order_payout": "floor(L0*((x1-x0) - (0.07/3.5)*(x1^3.5-x0^3.5)))",
+    "x0": "cumulative submitted value before the order divided by L0",
+    "x1": "cumulative submitted value after the order divided by L0"
+  },
+  "gate_order": [
+    "pricing feasibility: no profitable funded round trip and no failed split part",
+    "exact recovery parity",
+    "not dominated by a declared simple baseline",
+    "adds value over endpoint pricing and, when cadence is nonzero, pressure-only pricing",
+    "four-dimensional non-dominated frontier"
+  ],
+  "security_diagnostic": "every dust trace causes zero harm or attacker pricing loss exceeds victim harm",
+  "interpretation": "comparative characterization only"
+}

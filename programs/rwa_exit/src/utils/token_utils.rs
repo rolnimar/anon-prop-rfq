@@ -1,0 +1,647 @@
+use crate::constants::{seeds, MAX_BASIS_POINTS, PRICE_DECIMALS};
+use crate::errors::ProtocolError;
+use crate::utils::math_utils::ceil_div_u128;
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program_option::COption;
+use anchor_lang::system_program;
+use anchor_spl::associated_token::{self, get_associated_token_address_with_program_id};
+use anchor_spl::token_interface;
+use anchor_spl::token_interface::{
+    BurnChecked, Mint, MintToChecked, TokenAccount, TokenInterface, TransferChecked,
+};
+use spl_token_2022::extension::transfer_fee::TransferFeeConfig;
+use spl_token_2022::extension::{BaseStateWithExtensions, StateWithExtensions};
+
+pub fn validate_associated_token_address(
+    ata_account: &UncheckedAccount<'_>,
+    authority: &Pubkey,
+    mint: &Pubkey,
+    token_program_id: &Pubkey,
+    invalid_account_error: ProtocolError,
+) -> Result<()> {
+    let expected_ata =
+        get_associated_token_address_with_program_id(authority, mint, token_program_id);
+    if ata_account.key() != expected_ata {
+        return Err(invalid_account_error.into());
+    }
+    Ok(())
+}
+
+pub fn get_associated_token_account<'info>(
+    ata_account: &'info UncheckedAccount<'info>,
+    authority: &Pubkey,
+    mint: &Pubkey,
+    token_program_id: &Pubkey,
+    invalid_account_error: ProtocolError,
+) -> Result<InterfaceAccount<'info, TokenAccount>> {
+    // Validate that the provided account is the canonical ATA before loading it.
+    validate_associated_token_address(
+        ata_account,
+        authority,
+        mint,
+        token_program_id,
+        invalid_account_error,
+    )?;
+    InterfaceAccount::try_from(ata_account)
+}
+
+pub struct EnsureAtaParams<'info> {
+    pub ata_account: &'info UncheckedAccount<'info>,
+    pub payer: AccountInfo<'info>,
+    pub authority_account: AccountInfo<'info>,
+    pub mint_account: AccountInfo<'info>,
+    pub token_program: AccountInfo<'info>,
+    pub associated_token_program: AccountInfo<'info>,
+    pub system_program: AccountInfo<'info>,
+    pub authority: Pubkey,
+    pub mint: Pubkey,
+    pub token_program_id: Pubkey,
+    pub invalid_account_error: ProtocolError,
+}
+
+pub fn get_or_create_associated_token_account(
+    params: EnsureAtaParams,
+) -> Result<InterfaceAccount<TokenAccount>> {
+    // Validate that the provided account is the canonical ATA before using or creating it.
+    validate_associated_token_address(
+        params.ata_account,
+        &params.authority,
+        &params.mint,
+        &params.token_program_id,
+        params.invalid_account_error,
+    )?;
+
+    if params.ata_account.owner == &system_program::ID {
+        associated_token::create_idempotent(CpiContext::new(
+            params.associated_token_program.key(),
+            associated_token::Create {
+                payer: params.payer,
+                associated_token: params.ata_account.to_account_info(),
+                authority: params.authority_account,
+                mint: params.mint_account,
+                system_program: params.system_program,
+                token_program: params.token_program,
+            },
+        ))?;
+    }
+
+    InterfaceAccount::try_from(params.ata_account)
+}
+
+/// Generic token transfer function that handles both regular and PDA-signed transfers
+///
+/// # Arguments
+/// * `token_program` - The SPL Token program
+/// * `from_account` - Source token account
+/// * `to_account` - Destination token account  
+/// * `authority` - The authority that can transfer from the source account
+/// * `signer_seeds` - Optional PDA seeds for program-signed transfers (None for user-signed)
+/// * `amount` - Amount of tokens to transfer
+pub fn transfer_tokens<'info>(
+    mint: &InterfaceAccount<'info, Mint>,
+    token_program: &Interface<'info, TokenInterface>,
+    from_account: &InterfaceAccount<'info, TokenAccount>,
+    to_account: &InterfaceAccount<'info, TokenAccount>,
+    authority: &AccountInfo<'info>,
+    signer_seeds: Option<&[&[&[u8]]]>,
+    amount: u64,
+) -> Result<()> {
+    let transfer_accounts = TransferChecked {
+        mint: mint.to_account_info(),
+        from: from_account.to_account_info(),
+        to: to_account.to_account_info(),
+        authority: authority.to_account_info(),
+    };
+
+    let cpi_context = match signer_seeds {
+        Some(seeds) => CpiContext::new_with_signer(token_program.key(), transfer_accounts, seeds),
+        None => CpiContext::new(token_program.key(), transfer_accounts),
+    };
+
+    token_interface::transfer_checked(cpi_context, amount, mint.decimals)
+}
+
+/// Calculates token_out_amount based on token_in_amount, price, and decimals.
+/// This formula is used by offer pricing paths where `price` is token_in per Rwa.
+///
+/// Formula: token_out_amount = (token_in_amount * 10^(token_out_decimals + 9)) / (price * 10^token_in_decimals)
+///
+/// # Arguments
+/// * `token_in_amount` - Amount of input tokens
+/// * `price` - Price with 9 decimal precision (e.g., 2.0 = 2000000000)
+/// * `token_in_decimals` - Decimal places of input token
+/// * `token_out_decimals` - Decimal places of output token
+///
+/// # Returns
+/// The calculated amount of output tokens
+///
+/// # Errors
+/// Returns an error if calculation overflows or rounds down to zero output.
+/// Maximum allowed token decimals (prevents overflow in exponentiation)
+pub const MAX_TOKEN_DECIMALS: u8 = 18;
+
+pub fn calculate_token_out_amount(
+    token_in_amount: u64,
+    price: u64,
+    token_in_decimals: u8,
+    token_out_decimals: u8,
+) -> Result<u64> {
+    // Validate price is not zero
+    require!(price > 0, crate::ProtocolError::ZeroPriceNotAllowed);
+
+    // Validate decimal values are within reasonable bounds
+    require!(
+        token_in_decimals <= MAX_TOKEN_DECIMALS,
+        crate::ProtocolError::DecimalsExceedMax
+    );
+    require!(
+        token_out_decimals <= MAX_TOKEN_DECIMALS,
+        crate::ProtocolError::DecimalsExceedMax
+    );
+
+    let token_in_amount_u128 = token_in_amount as u128;
+    let price_u128 = price as u128;
+
+    // Calculate: numerator = token_in_amount * 10^(token_out_decimals + 9)
+    let numerator = token_in_amount_u128
+        .checked_mul(10_u128.pow((token_out_decimals + PRICE_DECIMALS) as u32))
+        .ok_or(crate::ProtocolError::MathOverflow)?;
+
+    // Calculate: denominator = price * 10^token_in_decimals
+    let denominator = price_u128
+        .checked_mul(10_u128.pow(token_in_decimals as u32))
+        .ok_or(crate::ProtocolError::MathOverflow)?;
+
+    let result = numerator / denominator;
+
+    // Validate result fits in u64 before casting
+    require!(
+        result <= u64::MAX as u128,
+        crate::ProtocolError::ResultOverflow
+    );
+    require!(result > 0, crate::ProtocolError::InvalidAmount);
+
+    Ok(result as u64)
+}
+
+/// Formats a u64 number as a decimal string with 9 decimal places
+///
+/// This function treats the input as a fixed-point number with 9 decimal places,
+/// where the last 9 digits represent the fractional part.
+///
+/// # Arguments
+/// * `n` - The number to format, with the last 9 digits as the fractional part
+///
+/// # Returns
+/// A string representation of the number with appropriate decimal formatting
+///
+/// # Examples
+/// * `u64_to_dec9(1_500_000_000)` returns `"1.5"`
+/// * `u64_to_dec9(123_456_789_012)` returns `"123.456789012"`
+/// * `u64_to_dec9(1_000_000_000)` returns `"1"`
+pub fn u64_to_dec9(n: u64) -> String {
+    let int_part = n / 1_000_000_000;
+    let frac_part = n % 1_000_000_000;
+
+    if frac_part == 0 {
+        return int_part.to_string();
+    }
+    let mut frac = format!("{:09}", frac_part);
+    while frac.ends_with('0') {
+        frac.pop();
+    }
+
+    format!("{}.{}", int_part, frac)
+}
+
+/// Result structure for fee calculation
+pub struct CalculateFeeResult {
+    /// The calculated fee amount in token_in units
+    pub token_in_fee_amount: u64,
+    /// The remaining token_in amount after fee deduction
+    pub token_in_net_amount: u64,
+}
+
+/// Calculates fee amount and remaining amount after fee deduction
+///
+/// # Arguments
+/// * `token_in_amount` - Total amount of token_in being processed
+/// * `fee_basis_points` - Fee percentage in basis points (e.g., 500 = 5%)
+///
+/// # Returns
+/// A `CalculateFeeResult` containing the fee amount and remaining amount
+///
+/// # Errors
+/// * `MathOverflow` - If calculations exceed u128 limits
+///
+/// # Example
+/// ```text
+/// // 5% fee on 1000 tokens = 50 fee, 950 remaining
+/// let result = calculate_fees(1000, 500)?;
+/// assert_eq!(result.token_in_fee_amount, 50);
+/// assert_eq!(result.token_in_net_amount, 950);
+/// ```
+pub fn calculate_fees(token_in_amount: u64, fee_basis_points: u16) -> Result<CalculateFeeResult> {
+    // Calculate fee amount in token_in tokens using ceiling division
+    // This ensures fees always round up in favor of the protocol
+    let fee_numerator = (token_in_amount as u128)
+        .checked_mul(fee_basis_points as u128)
+        .ok_or(crate::ProtocolError::MathOverflow)?;
+    let token_fee_amount = ceil_div_u128(fee_numerator, MAX_BASIS_POINTS as u128)
+        .ok_or(crate::ProtocolError::MathOverflow)? as u64;
+
+    // Amount after fee deduction for the main offer exchange
+    let token_net_amount = token_in_amount
+        .checked_sub(token_fee_amount)
+        .ok_or(crate::ProtocolError::MathOverflow)?;
+
+    Ok(CalculateFeeResult {
+        token_in_fee_amount: token_fee_amount,
+        token_in_net_amount: token_net_amount,
+    })
+}
+
+/// Validates that adding `amount` to `current_supply` does not exceed `max_supply`.
+///
+/// A `max_supply` of 0 disables the cap.
+///
+/// # Errors
+/// * `MathOverflow` - If `current_supply + amount` overflows.
+/// * `MaxSupplyExceeded` - If the resulting supply would exceed `max_supply`.
+pub fn validate_max_supply(current_supply: u64, amount: u64, max_supply: u64) -> Result<()> {
+    if max_supply > 0 {
+        let new_supply = current_supply
+            .checked_add(amount)
+            .ok_or(crate::ProtocolError::MathOverflow)?;
+
+        require!(
+            new_supply <= max_supply,
+            crate::ProtocolError::MaxSupplyExceeded
+        );
+    }
+
+    Ok(())
+}
+
+/// Mints tokens with max-supply and per-mint amount validation.
+///
+/// `max_supply == 0` or `max_mint_amount == 0` disables that respective cap.
+#[allow(clippy::too_many_arguments)]
+pub fn mint_tokens<'info>(
+    token_program: &Interface<'info, TokenInterface>,
+    mint: &InterfaceAccount<'info, Mint>,
+    to_account: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    signer_seeds: &[&[&[u8]]],
+    amount: u64,
+    max_supply: u64,
+    max_mint_amount: u64,
+) -> Result<()> {
+    if max_mint_amount > 0 {
+        require!(
+            amount <= max_mint_amount,
+            crate::ProtocolError::MaxMintAmountExceeded
+        );
+    }
+
+    validate_max_supply(mint.supply, amount, max_supply)?;
+
+    // Perform the mint operation
+    let mint_accounts = MintToChecked {
+        mint: mint.to_account_info(),
+        to: to_account.clone(),
+        authority: authority.to_account_info(),
+    };
+
+    let mint_ctx = CpiContext::new_with_signer(token_program.key(), mint_accounts, signer_seeds);
+
+    token_interface::mint_to_checked(mint_ctx, amount, mint.decimals)
+}
+
+/// Burns tokens from a user account using user authority
+///
+/// # Arguments
+/// * `token_program` - The SPL Token program
+/// * `mint` - The token mint to burn from
+/// * `from_account` - Source token account to burn from
+/// * `authority` - The burn authority (the token account owner)
+/// * `signer_seeds` - Optional PDA seeds for program-signed burning (None for user-signed)
+/// * `amount` - Amount of tokens to burn
+pub fn burn_tokens<'info>(
+    token_program: &Interface<'info, TokenInterface>,
+    mint: &InterfaceAccount<'info, Mint>,
+    from_account: &InterfaceAccount<'info, TokenAccount>,
+    authority: &AccountInfo<'info>,
+    signer_seeds: &[&[&[u8]]],
+    amount: u64,
+) -> Result<()> {
+    let burn_accounts = BurnChecked {
+        mint: mint.to_account_info(),
+        from: from_account.to_account_info(),
+        authority: authority.to_account_info(),
+    };
+
+    let cpi_context = CpiContext::new_with_signer(token_program.key(), burn_accounts, signer_seeds);
+
+    token_interface::burn_checked(cpi_context, amount, mint.decimals)
+}
+
+/// Parameters for executing token exchange operations
+///
+/// This structure contains all the accounts and parameters needed to execute
+/// a complete token exchange, handling both token_in payment and token_out distribution
+/// with support for both mint/burn and transfer operations.
+pub struct ExecTokenOpsParams<'a, 'info> {
+    /// SPL Token program for token_in operations
+    pub token_in_program: &'a Interface<'info, TokenInterface>,
+    /// SPL Token program for token_out operations
+    pub token_out_program: &'a Interface<'info, TokenInterface>,
+
+    // Token in params
+    /// Mint account for the input token
+    pub token_in_mint: &'a InterfaceAccount<'info, Mint>,
+    /// Amount of token_in to process (without fee)
+    pub token_in_net_amount: u64,
+    /// Amount of token_in fee
+    pub token_in_fee_amount: u64,
+    /// Authority that can transfer from the source account
+    pub token_in_authority: &'a AccountInfo<'info>,
+    /// Optional PDA seeds for program-signed token_in transfers
+    pub token_in_source_signer_seeds: Option<&'a [&'a [&'a [u8]]]>,
+    /// PDA seeds for vault authority operations
+    pub vault_authority_signer_seeds: Option<&'a [&'a [&'a [u8]]]>,
+    /// Source account for token_in.
+    pub token_in_source_account: &'a InterfaceAccount<'info, TokenAccount>,
+    /// Primary destination account for net token_in.
+    pub token_in_destination_account: &'a InterfaceAccount<'info, TokenAccount>,
+    /// Optional alternate destination for part of the net token_in amount.
+    pub token_in_refill_destination_account: Option<&'a InterfaceAccount<'info, TokenAccount>>,
+    /// Amount of net token_in to send to the alternate refill destination.
+    pub token_in_refill_amount: u64,
+    /// Destination account for token_in fees
+    pub token_in_fee_destination_account: &'a InterfaceAccount<'info, TokenAccount>,
+    /// Vault account for burning token_in when program has mint authority
+    pub token_in_burn_account: &'a InterfaceAccount<'info, TokenAccount>,
+    /// Authority for burning tokens from the vault
+    pub token_in_burn_authority: &'a AccountInfo<'info>,
+
+    // Token out params
+    /// Mint account for the output token
+    pub token_out_mint: &'a InterfaceAccount<'info, Mint>,
+    /// Amount of token_out to distribute
+    pub token_out_amount: u64,
+    /// Authority for token_out operations (vault authority)
+    pub token_out_authority: &'a AccountInfo<'info>,
+    /// Source account for token_out transfers (vault account)
+    pub token_out_source_account: &'a InterfaceAccount<'info, TokenAccount>,
+    /// Destination account for token_out.
+    pub token_out_destination_account: &'a InterfaceAccount<'info, TokenAccount>,
+    /// PDA for mint authority operations
+    pub mint_authority_pda: &'a AccountInfo<'info>,
+    /// Bump seed for mint authority PDA
+    pub mint_authority_bump: &'a [u8],
+    /// Maximum supply cap for token_out minting (0 = no cap)
+    pub token_out_max_supply: u64,
+    /// Maximum amount allowed in one token_out mint operation (0 = no cap)
+    pub token_out_max_mint_amount: u64,
+}
+
+/// Executes token operations for exchanging token_in for token_out
+///
+/// This function handles the complete token exchange process with intelligent routing
+/// based on mint authority ownership. It supports both mint/burn and transfer operations
+/// to provide maximum flexibility for different token configurations.
+///
+/// # Token In Processing
+/// - Validates that token_in does not have Token-2022 transfer fees
+/// - If program has mint authority:
+///   - Transfers net amount (after fees) to vault → burns only net amount
+///   - Transfers fee amount directly to the configured fee destination
+/// - If program lacks mint authority: transfers any refill amount to the redemption vault destination
+///   and the remaining net amount to the configured proceeds destination
+///
+/// # Token Out Processing
+/// - Validates that token_out does not have Token-2022 transfer fees
+/// - If program has mint authority: mints directly to user (inflationary)
+/// - If program lacks mint authority: transfers from vault to user (standard transfer)
+///
+/// # Arguments
+/// * `params` - Complete parameter structure containing all required accounts and amounts
+///
+/// # Returns
+/// * `Ok(())` - If all token operations complete successfully
+/// * `Err(_)` - If any transfer, mint, or burn operation fails
+///
+/// # Security
+/// - All operations use checked token instructions for decimal validation
+/// - PDA seeds are used for program-signed operations
+/// - Authority validation ensures only authorized transfers
+/// - Token-2022 tokens with transfer fees are completely blocked to prevent burn path issues and transfer discrepancies
+pub fn execute_token_operations(params: ExecTokenOpsParams) -> Result<()> {
+    // Validate that neither token has Token-2022 transfer fees
+    require!(
+        !has_transfer_fee(params.token_in_mint)?,
+        ProtocolError::TransferFeeNotSupported
+    );
+    require!(
+        !has_transfer_fee(params.token_out_mint)?,
+        ProtocolError::TransferFeeNotSupported
+    );
+
+    // Step 1: User pays token_in
+    let controls_token_in_mint =
+        program_controls_mint(params.token_in_mint, params.mint_authority_pda);
+
+    if controls_token_in_mint {
+        require!(
+            params.token_in_refill_amount == 0,
+            ProtocolError::InvalidAmount
+        );
+
+        // Transfer net amount to burn account
+        transfer_tokens(
+            params.token_in_mint,
+            params.token_in_program,
+            params.token_in_source_account,
+            params.token_in_burn_account,
+            params.token_in_authority,
+            params.token_in_source_signer_seeds,
+            params.token_in_net_amount,
+        )?;
+
+        // Burn only the net amount (fees are not burned)
+        burn_tokens(
+            params.token_in_program,
+            params.token_in_mint,
+            params.token_in_burn_account,
+            params.token_in_burn_authority,
+            params.vault_authority_signer_seeds.unwrap(),
+            params.token_in_net_amount,
+        )?;
+
+        // Transfer fee amount to the configured fee vault
+        if params.token_in_fee_amount > 0 {
+            msg!("Transferring fee amount to fee vault");
+            transfer_tokens(
+                params.token_in_mint,
+                params.token_in_program,
+                params.token_in_source_account,
+                params.token_in_fee_destination_account,
+                params.token_in_authority,
+                params.token_in_source_signer_seeds,
+                params.token_in_fee_amount,
+            )?;
+        }
+    } else {
+        require!(
+            params.token_in_refill_amount <= params.token_in_net_amount,
+            ProtocolError::InvalidAmount
+        );
+        let proceeds_amount = params
+            .token_in_net_amount
+            .checked_sub(params.token_in_refill_amount)
+            .ok_or(ProtocolError::ArithmeticUnderflow)?;
+
+        if params.token_in_refill_amount > 0 {
+            let refill_destination = params
+                .token_in_refill_destination_account
+                .ok_or(ProtocolError::InvalidVaultTokenInAccount)?;
+            transfer_tokens(
+                params.token_in_mint,
+                params.token_in_program,
+                params.token_in_source_account,
+                refill_destination,
+                params.token_in_authority,
+                params.token_in_source_signer_seeds,
+                params.token_in_refill_amount,
+            )?;
+        }
+
+        if proceeds_amount > 0 {
+            transfer_tokens(
+                params.token_in_mint,
+                params.token_in_program,
+                params.token_in_source_account,
+                params.token_in_destination_account,
+                params.token_in_authority,
+                params.token_in_source_signer_seeds,
+                proceeds_amount,
+            )?;
+        }
+
+        if params.token_in_fee_amount > 0 {
+            transfer_tokens(
+                params.token_in_mint,
+                params.token_in_program,
+                params.token_in_source_account,
+                params.token_in_fee_destination_account,
+                params.token_in_authority,
+                params.token_in_source_signer_seeds,
+                params.token_in_fee_amount,
+            )?;
+        }
+    }
+
+    // Step 2: Program distributes token_out
+    if program_controls_mint(params.token_out_mint, params.mint_authority_pda) {
+        let mint_authority_seeds = &[seeds::MINT_AUTHORITY, params.mint_authority_bump];
+        let mint_authority_signer_seeds = &[mint_authority_seeds.as_slice()];
+
+        mint_tokens(
+            params.token_out_program,
+            params.token_out_mint,
+            &params.token_out_destination_account.to_account_info(),
+            params.mint_authority_pda,
+            mint_authority_signer_seeds,
+            params.token_out_amount,
+            params.token_out_max_supply,
+            params.token_out_max_mint_amount,
+        )?;
+    } else {
+        transfer_tokens(
+            params.token_out_mint,
+            params.token_out_program,
+            params.token_out_source_account,
+            params.token_out_destination_account,
+            params.token_out_authority,
+            params.vault_authority_signer_seeds,
+            params.token_out_amount,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Returns true iff `mint.mint_authority == Some(mint_authority_pda.key())`.
+pub fn program_controls_mint<'info>(
+    mint: &InterfaceAccount<'info, Mint>,
+    mint_authority_pda: &AccountInfo<'info>,
+) -> bool {
+    matches!(mint.mint_authority, COption::Some(pk) if pk == mint_authority_pda.key())
+}
+
+/// Checks if a mint has Token-2022 transfer fee extension enabled with a non-zero fee
+///
+/// # Arguments
+/// * `mint` - The token mint to check
+///
+/// # Returns
+/// * `Ok(true)` - If the mint has transfer fees enabled AND the fee is non-zero
+/// * `Ok(false)` - If the mint does not have transfer fees, or has zero fees
+/// * `Err(_)` - If there's an error reading the mint data
+pub fn has_transfer_fee(mint: &InterfaceAccount<Mint>) -> Result<bool> {
+    let mint_info = mint.to_account_info();
+    let mint_data = mint_info.try_borrow_data()?;
+
+    // Try to parse as Token-2022 mint with extensions
+    let mint_with_extension =
+        StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&mint_data);
+
+    match mint_with_extension {
+        Ok(mint_state) => {
+            // Check if TransferFeeConfig extension exists
+            match mint_state.get_extension::<TransferFeeConfig>() {
+                Ok(transfer_fee_config) => {
+                    // Get the current epoch's transfer fee
+                    // TransferFeeConfig has two fee configs: older and newer
+                    // We need to check both transfer_fee_basis_points fields
+                    let clock = Clock::get()?;
+                    let fee_config = transfer_fee_config.get_epoch_fee(clock.epoch);
+                    Ok(u16::from(fee_config.transfer_fee_basis_points) > 0
+                        || u64::from(fee_config.maximum_fee) > 0)
+                }
+                Err(_) => {
+                    // No TransferFeeConfig extension
+                    Ok(false)
+                }
+            }
+        }
+        Err(_) => {
+            // Not a Token-2022 mint with extensions, or failed to parse
+            Ok(false)
+        }
+    }
+}
+
+/// Safely reads token amount from an optionally initialized token account.
+///
+/// Returns 0 when the account is missing, not owned by the provided token program,
+/// or cannot be deserialized as a token account.
+pub fn read_optional_token_account_amount(
+    token_account: &AccountInfo,
+    token_program: &Interface<TokenInterface>,
+) -> Result<u64> {
+    if token_account.owner != token_program.key {
+        return Ok(0);
+    }
+
+    if token_account.data_is_empty() {
+        return Ok(0);
+    }
+
+    let data_ref = token_account.data.borrow();
+    match TokenAccount::try_deserialize(&mut &data_ref[..]) {
+        Ok(parsed) => Ok(parsed.amount),
+        Err(_) => Ok(0),
+    }
+}

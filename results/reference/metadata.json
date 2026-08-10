@@ -1,0 +1,15 @@
+{
+  "protocol": "evaluation protocol revision 9",
+  "implementation_commit": "dc4999ea675b46e0ced77ab34ab100725df5d877",
+  "tracked_diff_hash": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+  "working_tree_dirty": false,
+  "working_tree_status": "",
+  "randomness": "none",
+  "initial_liquidity": 1000000000,
+  "curve_peg_haircut_bps": 700,
+  "curve_exponent_scaled": 25000,
+  "wall_sensitivity_scaled": 20000,
+  "cadence_threshold": 20,
+  "cadence_wave_scaled": 10000,
+  "epoch_duration_seconds": 86400
+}
