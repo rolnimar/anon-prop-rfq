@@ -1,11 +1,48 @@
-# Anonymous experiment artifact
+# Prop RFQ research artifact
 
 This repository reproduces the evaluation of a pressure-aware request-for-quote mechanism for immediate exits from tokenized real-world-asset portfolios.
 It contains the Rust implementation used by the host-side sweep, the rebuilt-SBF LiteSVM tests, an independent high-precision oracle, the fixed workloads, the resource profiler, and the committed reference results.
 
-The source uses generic names and a fresh program identifier for double-anonymous review.
-The implementation logic is otherwise the revision evaluated in the paper.
-The original project history and identifying metadata are not included.
+This artifact accompanies *Prop RFQ: Proprietary Request for Quote as Pressure-Aware Exit Pricing for Redeemable Real-World Asset Tokens* by Marian-Daniel Rolník, Ivan Homoliak, and Theodore Georgas.
+
+## Origin and modifications
+
+The program is derived from [OnRe's `onre-sol` implementation](https://github.com/onre-finance/onre-sol), copyright On Re Limited.
+We acknowledge OnRe and the upstream contributors for the implementation on which this research artifact is based.
+The paper's mechanism was developed with OnRe.
+
+The research additions include the fixed adversarial workloads, pricing baselines and ablations, parameter sweep, independent Python oracle, LiteSVM parity and regression tests, resource profiling, plotting, and paper-claim verification.
+The evaluated implementation includes the epoch-boundary recovery correction described in the paper; the negative-control patch restores the former behavior for comparison.
+See [NOTICE.md](NOTICE.md) for attribution, licensing scope, and revision provenance.
+
+The export retains the generic `rwa_exit` name and a separate program identifier originally used for anonymous review.
+These identifiers are retained for reproducibility and do not identify the live OnRe deployment.
+The export does not include the original development history, and its code and configuration should not be assumed to match the current upstream repository or production deployment.
+
+## Licensing and citation
+
+The software and research additions in this repository are distributed under the [MIT license](LICENSE.md).
+OnRe's original copyright and permission notice is preserved; third-party dependencies remain subject to their own licenses.
+The paper is licensed separately under **CC BY 4.0**.
+The paper's Creative Commons license does not apply to software linked from the paper.
+
+Citation metadata for the artifact and paper is provided in [CITATION.cff](CITATION.cff).
+When reporting a reproduction, also identify the artifact commit and the generated run metadata.
+
+## Evaluated revision
+
+The evaluated implementation is tagged `R1` at commit `dc4999ea675b46e0ced77ab34ab100725df5d877`.
+That commit is recorded in `results/reference/metadata.json` and `results/reference/resource_profile_metadata.json`.
+Commit `e56cbf410f85850ca3ff93fcf2fa19e39c7b38db` packages the same program, tests, and evaluation harness with the committed reference outputs and updated verification tooling.
+The `R1` tag and the packaged snapshot are separate root commits, not a parent-child sequence.
+The historical reference metadata is retained unchanged.
+Use the current checkout, which includes the restored license and attribution, to reproduce the experiments; regenerated metadata will record that checkout's commit and working-tree state.
+
+## Security experiments
+
+This artifact deliberately demonstrates order-splitting and cadence-griefing techniques in controlled evaluation workloads.
+It also includes a negative control that restores a known recovery defect in an isolated worktree and checks that the oracle detects it.
+These experiments document limitations of the mechanism and are intended for local research and reproducibility, not deployment against a live protocol.
 
 ## Requirements
 
@@ -72,7 +109,3 @@ The repository must be clean before this command is run.
 | `scripts/verify_paper_claims.py` | Machine-readable claim-to-output checks |
 | `CLAIM_MAP.md` | Paper claim to command and file mapping |
 | `results/reference` | Frozen reference output |
-
-The license notice is intentionally withheld from the anonymous review artifact because it identifies the authors.
-It must be restored before any non-review publication of the source.
-

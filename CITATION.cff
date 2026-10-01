@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "Please cite the paper when using this artifact, and identify the artifact commit used for your experiments."
+title: "Prop RFQ research artifact"
+type: software
+authors:
+  - name: "On Re Limited"
+  - name: "Prop RFQ artifact contributors"
+license: MIT
+preferred-citation:
+  type: conference-paper
+  title: "Prop RFQ: Proprietary Request for Quote as Pressure-Aware Exit Pricing for Redeemable Real-World Asset Tokens"
+  authors:
+    - family-names: "Rolník"
+      given-names: "Marian-Daniel"
+    - family-names: "Homoliak"
+      given-names: "Ivan"
+    - family-names: "Georgas"
+      given-names: "Theodore"
+  year: 2026

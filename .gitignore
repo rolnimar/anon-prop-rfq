@@ -5,3 +5,13 @@ results/reference/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Local credentials and wallet material must not enter the public artifact.
+.env
+.env.*
+!.env.example
+!.env.sample
+*-keypair.json
+id.json
+*.pem
+*.key
