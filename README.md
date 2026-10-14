@@ -65,6 +65,18 @@ Run:
 make reproduce
 ```
 
+The build checks registered Solana SBF toolchains before invoking Anchor and never uninstalls them by default.
+If a previous SBF build left a matching registration, preparation stops to avoid an Anchor 1.1.2 parsing bug and lists the affected registrations.
+To explicitly remove those global rustup registrations and retry, run:
+
+```bash
+bash scripts/prepare-anchor-sbpf-toolchain.sh --cleanup-existing
+make reproduce
+```
+
+The opt-in cleanup removes only registrations whose names match `*-sbpf-solana-v*`.
+The platform tools recreate the required link during the build.
+
 The target performs these steps in order:
 
 1. checks that the committed oracle vectors match the independent Python model;
